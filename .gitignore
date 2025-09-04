@@ -1,0 +1,17 @@
+# Ignore latency output files
+latencies/stream_async_*.ndjson
+latencies/stream_sync_*.ndjson
+
+# Ignore build artifacts and cache
+build/
+.cache/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.o
+*.obj
+*.exe
+*.out
+*.log
+
