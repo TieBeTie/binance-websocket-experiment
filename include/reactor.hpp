@@ -37,13 +37,11 @@ public:
     }
     threads_.reserve(static_cast<std::size_t>(numThreads));
     for (int i = 0; i < numThreads; ++i) {
-      threads_.emplace_back([this, pinCpu, i] {
+      threads_.emplace_back([this, pinCpu] {
 #ifdef __linux__
         if (pinCpu.has_value()) {
-          CpuAffinity::PinThisThreadToCpu(*pinCpu);
+          CpuAffinity::PinThisThreadToCpu("reactor", *pinCpu);
         } else {
-          std::string tag = std::string("reactor[") + std::to_string(i) + "]";
-          (void)tag; // name only for log
           CpuAffinity::PickAndPin("reactor");
         }
 #endif

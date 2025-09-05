@@ -41,7 +41,7 @@ public:
     worker_ = std::jthread([this, pinCpu] {
 #ifdef __linux__
       if (pinCpu.has_value()) {
-        CpuAffinity::PinThisThreadToCpu(*pinCpu);
+        CpuAffinity::PinThisThreadToCpu("file_logger", *pinCpu);
       } else {
         CpuAffinity::PickAndPin("file_logger");
       }

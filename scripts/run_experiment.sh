@@ -4,8 +4,17 @@ cd "$(dirname "$0")/.."
 
 mkdir -p latencies
 
-# Build
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release >/dev/null
+# Prebuild (warm up compile cache and generate debug symbols)
+if command -v g++-13 >/dev/null 2>&1; then
+  CXX=g++-13; CC=gcc-13
+else
+  CXX=g++; CC=gcc
+fi
+cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_COMPILER=${CXX} -DCMAKE_C_COMPILER=${CC} >/dev/null
+cmake --build build -j >/dev/null
+
+# Build (Release) for runs
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=${CXX} -DCMAKE_C_COMPILER=${CC} >/dev/null
 cmake --build build -j >/dev/null
 
 

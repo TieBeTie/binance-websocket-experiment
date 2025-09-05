@@ -52,7 +52,7 @@ public:
     worker_ = std::jthread([this, pinCpu] {
 #ifdef __linux__
       if (pinCpu.has_value()) {
-        CpuAffinity::PinThisThreadToCpu(*pinCpu);
+        CpuAffinity::PinThisThreadToCpu("stream_merger", *pinCpu);
       } else {
         CpuAffinity::PickAndPin("stream_merger");
       }

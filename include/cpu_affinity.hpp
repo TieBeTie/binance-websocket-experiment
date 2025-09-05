@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <ctime>
 #include <iostream>
 #include <mutex>
 #include <optional>
@@ -19,12 +20,26 @@ class CpuAffinity {
 public:
   static bool PinThisThreadToCpu(int cpu) {
 #ifdef __linux__
+    return PinThisThreadToCpu("thread", cpu);
+#else
+    (void)cpu;
+    return false;
+#endif
+  }
+
+  static bool PinThisThreadToCpu(const char *who, int cpu) {
+#ifdef __linux__
     cpu_set_t set;
     CPU_ZERO(&set);
     CPU_SET(cpu, &set);
     int rc = pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
-    return rc == 0;
+    if (rc == 0) {
+      PrintPinned(who ? who : "thread", cpu);
+      return true;
+    }
+    return false;
 #else
+    (void)who;
     (void)cpu;
     return false;
 #endif
@@ -102,9 +117,7 @@ public:
         rr_idx_++;
       }
     }
-    if (chosen >= 0 && PinThisThreadToCpu(chosen)) {
-      std::cout << "[affinity] " << (who ? who : "thread") << " pinned to CPU "
-                << chosen << "\n";
+    if (chosen >= 0 && PinThisThreadToCpu(who ? who : "thread", chosen)) {
       return chosen;
     }
     return std::nullopt;
@@ -140,7 +153,9 @@ private:
       }
       if (strcmp(tag, "cpu") == 0) {
         char buf[512];
-        fgets(buf, sizeof(buf), f);
+        if (fgets(buf, sizeof(buf), f) == nullptr) {
+          break;
+        }
         continue;
       }
       CpuSample s{};
@@ -156,6 +171,31 @@ private:
     return !out.empty();
   }
 #endif
+
+  static void PrintPinned(const char *who, int cpu) {
+#ifdef __linux__
+    std::time_t t = std::time(nullptr);
+    struct tm tm_buf;
+    char ts[32];
+    if (localtime_r(&t, &tm_buf) != nullptr) {
+      if (std::strftime(ts, sizeof(ts), "%H:%M:%S", &tm_buf) == 0) {
+        ts[0] = '\0';
+      }
+    } else {
+      ts[0] = '\0';
+    }
+    if (ts[0] != '\0') {
+      std::cout << "[" << ts << "] [affinity] " << (who ? who : "thread")
+                << " pinned to CPU " << cpu << "\n";
+    } else {
+      std::cout << "[affinity] " << (who ? who : "thread") << " pinned to CPU "
+                << cpu << "\n";
+    }
+#else
+    (void)who;
+    (void)cpu;
+#endif
+  }
 
   inline static std::mutex m_;
   inline static std::vector<int> used_;
