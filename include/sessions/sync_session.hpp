@@ -1,11 +1,11 @@
 #pragma once
 
-#include "backoff.hpp"
-#include "latency.hpp"
-#include "logger.hpp"
-#include "message.hpp"
-#include "sessions/isession.hpp"
-#include "ws_ops.hpp"
+#include "core/isession.hpp"
+#include "core/message.hpp"
+#include "logging/logger.hpp"
+#include "net/backoff.hpp"
+#include "net/ws_ops.hpp"
+#include "util/latency.hpp"
 #include <boost/asio.hpp>
 #include <boost/asio/ssl.hpp>
 #include <boost/beast/core.hpp>
@@ -14,7 +14,6 @@
 #include <boost/beast/websocket/ssl.hpp>
 #include <ctime>
 #include <expected>
-#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <openssl/err.h>
@@ -62,72 +61,90 @@ public:
   }
 
   void Start() override {
-    jthread_ = std::jthread([this] { this->Run(); });
+    jthread_ = std::jthread([this](std::stop_token st) { this->Run(st); });
+  }
+
+  ~SyncSession() {
+    if (jthread_.joinable()) {
+      try {
+        jthread_.request_stop();
+      } catch (...) {
+      }
+    }
   }
 
 private:
-  void Run() {
-    Backoff backoff;
+  void Run(std::stop_token st) {
+    retry::Backoff backoff;
     for (;;) {
+      if (st.stop_requested()) {
+        break;
+      }
       net::io_context ioc;
       ssl::context ssl_ctx(ssl::context::tls_client);
       ssl_ctx.set_default_verify_paths();
       ssl_ctx.set_verify_mode(ssl::verify_peer);
 
       websocket::stream<beast::ssl_stream<beast::tcp_stream>> ws(ioc, ssl_ctx);
+      if (st.stop_requested()) {
+        break;
+      }
       if (!FastConnectSequence(ws, backoff)) {
         continue;
       }
 
       backoff.Reset();
-      beast::error_code ec = ReadLoop(ws);
-      std::cerr << "[session " << index_
-                << "] reconnecting after error: " << ec.message() << "\n";
-      WaitSync(backoff.Next());
+      beast::error_code ec = ReadLoop(st, ws);
+      if (ec && ec != beast::error::timeout &&
+          ec != net::error::operation_aborted) {
+        std::cerr << "[session " << index_
+                  << "] reconnecting after error: " << ec.message() << "\n";
+      }
+      retry::WaitSync(backoff.Next());
     }
   }
 
   bool FastConnectSequence(
       websocket::stream<beast::ssl_stream<beast::tcp_stream>> &ws,
-      Backoff &backoff) {
+      retry::Backoff &backoff) {
     tcp::resolver resolver(ws.get_executor());
 
-    auto st_resolve = Resolve(resolver, host_, port_);
+    auto st_resolve = wsops::Resolve(resolver, host_, port_);
     if (!st_resolve) {
       OnError("resolve", st_resolve.error());
-      WaitSync(backoff.Next());
+      retry::WaitSync(backoff.Next());
       return false;
     }
 
     auto st_connect =
-        Connect(beast::get_lowest_layer(ws).socket(), *st_resolve);
+        wsops::Connect(beast::get_lowest_layer(ws).socket(), *st_resolve);
     if (!st_connect) {
       OnError("connect", st_connect.error());
-      WaitSync(backoff.Next());
+      retry::WaitSync(backoff.Next());
       return false;
     }
 
-    if (auto st = SetSni(ws.next_layer(), host_); !st) {
+    if (auto st = wsops::SetSni(ws.next_layer(), host_); !st) {
       OnError("sni", st.error());
-      WaitSync(backoff.Next());
+      retry::WaitSync(backoff.Next());
       return false;
     }
 
-    SetTcpNoDelay(beast::get_lowest_layer(ws));
+    wsops::SetTcpNoDelay(beast::get_lowest_layer(ws));
 
-    auto st_tls = TlsHandshake(ws.next_layer());
+    auto st_tls = wsops::TlsHandshake(ws.next_layer());
     if (!st_tls) {
       OnError("handshake", st_tls.error());
-      WaitSync(backoff.Next());
+      retry::WaitSync(backoff.Next());
       return false;
     }
 
-    ConfigureWebSocket(ws, std::string("webhook-parsing/0.1"));
+    wsops::ConfigureWebSocket(ws, std::string("webhook-parsing/0.1"));
 
-    auto st_ws = WsHandshake(ws, host_, target_);
+    auto st_ws = wsops::WsHandshake(ws, host_, target_);
     if (!st_ws) {
       OnError("ws handshake", st_ws.error());
-      WaitSync(backoff.Next());
+      retry::WaitSync(backoff.Next());
       return false;
     }
 
@@ -135,17 +152,29 @@ private:
   }
 
   beast::error_code
-  ReadLoop(websocket::stream<beast::ssl_stream<beast::tcp_stream>> &ws) {
+  ReadLoop(std::stop_token st,
+           websocket::stream<beast::ssl_stream<beast::tcp_stream>> &ws) {
     for (;;) {
+      if (st.stop_requested()) {
+        return {};
+      }
       beast::flat_buffer buffer;
       beast::error_code ec;
+      // Короткий дедлайн для регулярной проверки stop_token
+      beast::get_lowest_layer(ws).expires_after(std::chrono::milliseconds(200));
       ws.read(buffer, ec);
       if (ec) {
+        if (ec == beast::error::timeout) {
+          if (st.stop_requested()) {
+            return {};
+          }
+          continue;
+        }
         return ec;
       }
-      const auto now_ms = EpochMillisUtc();
+      const auto now_ms = lat::EpochMillisUtc();
       std::string payload = beast::buffers_to_string(buffer.data());
-      auto t = ExtractEventTimestampMs(payload);
+      auto t = lat::ExtractEventTimestampMs(payload);
       if (logger_ && t) {
         logger_->LogLatency(session_queue_id_, now_ms - *t);
       }

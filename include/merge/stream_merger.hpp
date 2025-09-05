@@ -1,10 +1,9 @@
 #pragma once
 
-#include "message.hpp"
+#include "core/message.hpp"
 #include <atomic>
 #include <charconv>
 #include <chrono>
-#include <memory>
 #include <optional>
 #include <queue>
 #include <string>
@@ -14,8 +13,8 @@
 #include <pthread.h>
 #include <sched.h>
 #endif
-#include "cpu_affinity.hpp"
-#include "file_writer.hpp"
+#include "io/file_writer.hpp"
+#include "util/cpu_affinity.hpp"
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -118,8 +117,6 @@ private:
     }
     return std::nullopt;
   }
-
-  // use io::WriteAll from file_writer.hpp
 
   // Returns true if all producer SPSC queues are currently empty
   bool AllQueuesEmpty() const {

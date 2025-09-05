@@ -4,6 +4,8 @@ latencies/stream_sync_*.ndjson
 
 # Ignore build artifacts and cache
 build/
+build-asan/
+latencies/
 .cache/
 CMakeFiles/
 CMakeCache.txt

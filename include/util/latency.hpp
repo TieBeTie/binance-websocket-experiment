@@ -8,6 +8,10 @@
 #include <string>
 #include <vector>
 
+// namespace lat — small helpers for timestamp extraction and timepoints used in
+// latency measurement. Keeps parsing and time utilities in one place.
+namespace lat {
+
 inline std::int64_t EpochMillisUtc() {
   using clock = std::chrono::system_clock;
   return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -81,3 +85,5 @@ ExtractEventTimestampMs(const std::string &s) {
   }
   return neg ? -value : value;
 }
+
+} // namespace lat

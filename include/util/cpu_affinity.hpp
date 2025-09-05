@@ -16,6 +16,12 @@
 #include <unistd.h>
 #endif
 
+// CpuAffinity — tiny Linux helper to pin long‑running threads to specific
+// // CPUs and to auto‑pick a least‑busy allowed CPU. Used to stabilize latency
+// by reducing context switches (e.g., Reactor, StreamMerger, FileLogger).
+// API: PinThisThreadToCpu(...), PickLeastBusyAllowedCpuExcluding(...),
+// PickAndPin(...), ResetUsed(). Thread‑safe; honors sched_getaffinity; no‑ops
+// on non‑Linux.
 class CpuAffinity {
 public:
   static bool PinThisThreadToCpu(int cpu) {

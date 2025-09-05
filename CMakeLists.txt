@@ -13,18 +13,12 @@ find_package(Boost REQUIRED COMPONENTS system context coroutine)
 find_package(OpenSSL REQUIRED)
 
 add_executable(webhook_parsing
-  src/url.cpp
-  include/stream_merger.hpp
-  include/reactor.hpp
-  include/runner.hpp
-  include/sessions/isession.hpp
-  include/sessions/async_session.hpp
-  include/sessions/sync_session.hpp
   src/main.cpp
 )
 
 target_include_directories(webhook_parsing PRIVATE ${Boost_INCLUDE_DIRS})
 target_include_directories(webhook_parsing PRIVATE include)
+target_include_directories(webhook_parsing PRIVATE include/core include/net include/sessions include/merge include/logging include/util include/io)
 target_link_libraries(webhook_parsing PRIVATE
   Boost::system
   Boost::context

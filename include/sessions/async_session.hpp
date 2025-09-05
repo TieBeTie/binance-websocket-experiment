@@ -1,11 +1,11 @@
 #pragma once
 
-#include "backoff.hpp"
-#include "latency.hpp"
-#include "logger.hpp"
-#include "message.hpp"
-#include "sessions/isession.hpp"
-#include "ws_ops.hpp"
+#include "core/isession.hpp"
+#include "core/message.hpp"
+#include "logging/logger.hpp"
+#include "net/backoff.hpp"
+#include "net/ws_ops.hpp"
+#include "util/latency.hpp"
 #include <boost/asio.hpp>
 #include <boost/asio/spawn.hpp>
 #include <boost/asio/ssl.hpp>
@@ -14,7 +14,6 @@
 #include <boost/beast/websocket.hpp>
 #include <boost/beast/websocket/ssl.hpp>
 #include <ctime>
-#include <expected>
 #include <iomanip>
 #include <iostream>
 #include <openssl/err.h>
@@ -69,7 +68,7 @@ public:
 
 private:
   void Run(net::yield_context yield) {
-    Backoff backoff;
+    retry::Backoff backoff;
     for (;;) {
       websocket::stream<beast::ssl_stream<tcp::socket>> ws(ioc_, ssl_ctx_);
       if (!FastConnectSequence(yield, ws, backoff)) {
@@ -79,7 +78,7 @@ private:
       beast::error_code ec = ReadLoop(yield, ws);
       std::cerr << "[async_session " << index_
                 << "] reconnecting after error: " << ec.message() << "\n";
-      WaitAsync(ioc_, yield, backoff.Next());
+      retry::WaitAsync(ioc_, yield, backoff.Next());
     }
   }
 
@@ -89,41 +88,41 @@ private:
   bool
   FastConnectSequence(net::yield_context yield,
                       websocket::stream<beast::ssl_stream<tcp::socket>> &ws,
-                      Backoff &backoff) {
+                      retry::Backoff &backoff) {
     tcp::resolver resolver(ioc_);
     // Resolve
-    auto resultsExp = AsyncResolve(resolver, host_, port_, yield);
+    auto resultsExp = wsops::AsyncResolve(resolver, host_, port_, yield);
     if (!resultsExp) {
       OnError("resolve", resultsExp.error(), yield, backoff);
       return false;
     }
     // TCP connect
     auto st_connect =
-        AsyncConnect(beast::get_lowest_layer(ws), *resultsExp, yield);
+        wsops::AsyncConnect(beast::get_lowest_layer(ws), *resultsExp, yield);
     if (!st_connect) {
       OnError("connect", st_connect.error(), yield, backoff);
       return false;
     }
     // SNI
-    if (auto st = SetSni(ws.next_layer(), host_); !st) {
+    if (auto st = wsops::SetSni(ws.next_layer(), host_); !st) {
       OnError("sni", st.error(), yield, backoff);
       return false;
     }
 
     // TCP_NODELAY
-    SetTcpNoDelay(beast::get_lowest_layer(ws));
+    wsops::SetTcpNoDelay(beast::get_lowest_layer(ws));
 
     // TLS handshake
-    auto st_tls = AsyncTlsHandshake(ws.next_layer(), yield);
+    auto st_tls = wsops::AsyncTlsHandshake(ws.next_layer(), yield);
     if (!st_tls) {
       OnError("handshake", st_tls.error(), yield, backoff);
       return false;
     }
 
     // Configure WS: disable permessage-deflate, set UA decorator
-    ConfigureWebSocket(ws, std::string("webhook-parsing/async/0.1"));
+    wsops::ConfigureWebSocket(ws, std::string("webhook-parsing/async/0.1"));
     // WS handshake
-    auto st_ws = AsyncWsHandshake(ws, host_, target_, yield);
+    auto st_ws = wsops::AsyncWsHandshake(ws, host_, target_, yield);
     if (!st_ws) {
       OnError("ws handshake", st_ws.error(), yield, backoff);
       return false;
@@ -156,9 +155,9 @@ private:
       if (ec) {
         break;
       }
-      const auto now_ms = EpochMillisUtc();
+      const auto now_ms = lat::EpochMillisUtc();
       std::string payload = beast::buffers_to_string(buffer.data());
-      auto t = ExtractEventTimestampMs(payload);
+      auto t = lat::ExtractEventTimestampMs(payload);
       if (logger_ && t) {
         logger_->LogLatency(session_queue_id_, now_ms - *t);
       }
@@ -171,10 +170,10 @@ private:
   }
 
   void OnError(const char *stage, const beast::error_code &ec,
-               net::yield_context yield, Backoff &backoff) {
+               net::yield_context yield, retry::Backoff &backoff) {
     std::cerr << "[async_session " << index_ << "] " << stage
               << " error: " << ec.message() << "\n";
-    WaitAsync(ioc_, yield, backoff.Next());
+    retry::WaitAsync(ioc_, yield, backoff.Next());
   }
 
   int index_;

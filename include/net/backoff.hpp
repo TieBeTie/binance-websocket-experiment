@@ -7,6 +7,10 @@
 #include <cstddef>
 #include <thread>
 
+// namespace retry — small utilities for connection/backoff waits in sessions.
+// Provides simple exponential backoff state plus sync/async sleep helpers.
+namespace retry {
+
 namespace net = boost::asio;
 
 struct Backoff {
@@ -33,3 +37,5 @@ inline void WaitAsync(net::io_context &ioc, net::yield_context yield,
   t.async_wait(yield[ec]);
   (void)ec;
 }
+
+} // namespace retry

@@ -1,5 +1,5 @@
-#include "runner.hpp"
-#include "url.hpp"
+#include "core/runner.hpp"
+#include "net/url.hpp"
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -36,7 +36,7 @@ static Options ParseArgs(int argc, char **argv) {
 
 int main(int argc, char **argv) {
   auto opt = ParseArgs(argc, argv);
-  auto url = ParseWssUrl(opt.url);
+  auto url = URL::ParseWssUrl(opt.url);
   if (!url) {
     std::cerr << "Invalid URL (expected wss://host[:port]/path): " << opt.url
               << "\n";

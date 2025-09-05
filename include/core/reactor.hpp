@@ -10,7 +10,7 @@
 #include <pthread.h>
 #include <sched.h>
 #endif
-#include "cpu_affinity.hpp"
+#include "util/cpu_affinity.hpp"
 
 namespace net = boost::asio;
 namespace ssl = net::ssl;

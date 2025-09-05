@@ -15,8 +15,8 @@
 #include <pthread.h>
 #include <sched.h>
 #endif
-#include "cpu_affinity.hpp"
-#include "file_writer.hpp"
+#include "io/file_writer.hpp"
+#include "util/cpu_affinity.hpp"
 
 // LogEvent: pre-formatted line (ASCII digits + optional '-') ready for write
 struct LogEvent {
@@ -73,7 +73,9 @@ public:
   static constexpr std::size_t kRingCapacity = 1u << 16;
 
   FileLogger() = default;
+
   ~FileLogger() {
+    alive_.store(false, std::memory_order_relaxed);
     Join();
     CloseAll();
   }
@@ -88,6 +90,9 @@ public:
   }
 
   void LogLatency(uint16_t sessionId, std::int64_t deltaMs) {
+    if (!alive_.load(std::memory_order_relaxed)) {
+      return;
+    }
     if (sessionId >= queues_.size()) {
       return;
     }
@@ -180,4 +185,5 @@ private:
                                   boost::lockfree::capacity<kRingCapacity>>;
   std::vector<std::unique_ptr<QueueType>> queues_;
   std::vector<int> fds_;
+  std::atomic<bool> alive_{true};
 };

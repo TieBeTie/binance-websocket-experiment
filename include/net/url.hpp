@@ -1,5 +1,17 @@
-#include "url.hpp"
+#pragma once
+
 #include <boost/algorithm/string/predicate.hpp>
+#include <optional>
+#include <string>
+
+namespace URL {
+
+struct UrlParts {
+  std::string scheme;
+  std::string host;
+  std::string port;
+  std::string target;
+};
 
 std::optional<UrlParts> ParseWssUrl(const std::string &url) {
   std::string u = url;
@@ -21,3 +33,5 @@ std::optional<UrlParts> ParseWssUrl(const std::string &url) {
   return UrlParts{
       .scheme = "wss", .host = host, .port = port, .target = target};
 }
+
+}; // namespace URL
