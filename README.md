@@ -1,6 +1,6 @@
 Low‑latency Binance WebSocket client (C++)
 
-Results: see `charts/latency_charts.ipynb`.
+Results: see [charts/latency_charts.ipynb](charts/latency_charts.ipynb).
 
 What this project does
 
@@ -21,10 +21,10 @@ Quick start
 
 Where to read more
 
-- Task brief: ` docs/task.md `
-- Architecture: ` docs/architecture.md `
-- Python baseline script: ` docs/example.py `
-- Results & charts (Jupyter): ` charts/latency_charts.ipynb `
+- Task brief: [docs/task.md](docs/task.md)
+- Architecture: [docs/architecture.md](docs/architecture.md)
+- Python baseline script: [docs/example.py](docs/example.py)
+- Results & charts (Jupyter): [charts/latency_charts.ipynb](charts/latency_charts.ipynb)
 
 Outputs
 
