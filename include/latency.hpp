@@ -81,20 +81,3 @@ ExtractEventTimestampMs(const std::string &s) {
   }
   return neg ? -value : value;
 }
-
-struct Percentiles {
-  double p50 = 0, p90 = 0, p99 = 0;
-};
-
-inline Percentiles ComputePercentiles(std::vector<double> v) {
-  if (v.empty())
-    return {};
-  auto nth = [&](double p) {
-    if (v.empty())
-      return 0.0;
-    std::size_t idx = static_cast<std::size_t>(p * (v.size() - 1));
-    std::nth_element(v.begin(), v.begin() + idx, v.end());
-    return v[idx];
-  };
-  return {nth(0.50), nth(0.90), nth(0.99)};
-}

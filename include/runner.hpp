@@ -5,7 +5,7 @@
 #include "reactor.hpp"
 #include "sessions/async_session.hpp"
 #include "sessions/isession.hpp"
-#include "sessions/session.hpp"
+#include "sessions/sync_session.hpp"
 #include "stream_merger.hpp"
 #include <chrono>
 #include <memory>
@@ -17,6 +17,16 @@
 #include <sched.h>
 #endif
 
+// Runner composition/threading overview:
+// - Reactor: runs io_context on 1 thread (pinned), hosts AsyncSession
+// coroutines
+// - AsyncSession: coroutines on reactor thread; non-blocking I/O, producer to
+// SPSC
+// - Session (sync): dedicated jthread per session; blocking I/O, producer to
+// SPSC
+// - StreamMerger: dedicated jthread; consumes all SPSC, min-heap reorder by `u`
+// - FileLogger: dedicated jthread; drains per-session SPSC rings with writev
+// - Main thread: sleeps to deadline, then stops reactor, joins components
 struct RunOptions {
   std::string host;
   std::string port;
@@ -50,7 +60,7 @@ inline int Run(const RunOptions &opt, RunMode mode) {
   } else {
     sessions.reserve(opt.numConnections);
     for (int i = 0; i < opt.numConnections; ++i) {
-      sessions.emplace_back(std::make_unique<Session>(
+      sessions.emplace_back(std::make_unique<SyncSession>(
           i, opt.host, opt.port, opt.target, queues[i], &logger));
     }
   }
@@ -67,7 +77,7 @@ inline int Run(const RunOptions &opt, RunMode mode) {
   }
 
   StreamMerger merger{queues, opt.outFile};
-  if (!merger.open_ok()) {
+  if (!merger.OpenOk()) {
     return 1;
   }
 

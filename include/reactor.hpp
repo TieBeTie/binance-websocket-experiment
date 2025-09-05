@@ -10,10 +10,17 @@
 #include <pthread.h>
 #include <sched.h>
 #endif
+#include "cpu_affinity.hpp"
 
 namespace net = boost::asio;
 namespace ssl = net::ssl;
 
+// Reactor
+// Threading model:
+// - Owns a single io_context shared by all async sessions
+// - Runs io_context::run() on N std::jthread workers (typically 1 for low
+//   latency); sessions execute as coroutines on these threads
+// - Optional CPU pinning for the first worker to improve cache locality
 class Reactor {
 public:
   Reactor() : ssl_ctx_(ssl::context::tls_client) {
@@ -25,9 +32,6 @@ public:
   ssl::context &GetSslContext() { return ssl_ctx_; }
 
   void Start(int numThreads = 1, std::optional<int> pinCpu = std::nullopt) {
-    if (numThreads < 1) {
-      numThreads = 1;
-    }
     if (!work_guard_.has_value()) {
       work_guard_.emplace(ioc_.get_executor());
     }
@@ -35,11 +39,12 @@ public:
     for (int i = 0; i < numThreads; ++i) {
       threads_.emplace_back([this, pinCpu, i] {
 #ifdef __linux__
-        if (pinCpu.has_value() && i == 0) {
-          cpu_set_t cpuset;
-          CPU_ZERO(&cpuset);
-          CPU_SET(*pinCpu, &cpuset);
-          pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+        if (pinCpu.has_value()) {
+          CpuAffinity::PinThisThreadToCpu(*pinCpu);
+        } else {
+          std::string tag = std::string("reactor[") + std::to_string(i) + "]";
+          (void)tag; // name only for log
+          CpuAffinity::PickAndPin("reactor");
         }
 #endif
         ioc_.run();

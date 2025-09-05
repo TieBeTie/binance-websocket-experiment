@@ -5,7 +5,6 @@
 #include <string>
 
 struct Message {
-  int connection_index;
   std::int64_t arrival_epoch_ms;
   std::string payload;
 };

@@ -19,7 +19,7 @@ add_executable(webhook_parsing
   include/runner.hpp
   include/sessions/isession.hpp
   include/sessions/async_session.hpp
-  include/sessions/session.hpp
+  include/sessions/sync_session.hpp
   src/main.cpp
 )
 
@@ -35,7 +35,7 @@ target_link_libraries(webhook_parsing PRIVATE
 
 if (NOT MSVC)
   target_link_options(webhook_parsing PRIVATE -pthread)
-  target_compile_options(webhook_parsing PRIVATE -pthread)
+  target_compile_options(webhook_parsing PRIVATE -pthread -fno-omit-frame-pointer)
 endif()
 
 if (MSVC)

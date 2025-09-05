@@ -15,12 +15,20 @@
 #include <pthread.h>
 #include <sched.h>
 #endif
+#include "cpu_affinity.hpp"
+#include "file_writer.hpp"
 
+// LogEvent: pre-formatted line (ASCII digits + optional '-') ready for write
 struct LogEvent {
   uint16_t len;
   char buf[32];
 };
 
+// LoggerBase
+// Threading model:
+// - Owns one background std::jthread worker (started via Start)
+// - Derived class implements RunLoop() and controls draining strategy
+// - Join() stops the worker and waits for clean shutdown
 template <typename Derived> class LoggerBase {
 public:
   LoggerBase() = default;
@@ -33,10 +41,9 @@ public:
     worker_ = std::jthread([this, pinCpu] {
 #ifdef __linux__
       if (pinCpu.has_value()) {
-        cpu_set_t cpuset;
-        CPU_ZERO(&cpuset);
-        CPU_SET(*pinCpu, &cpuset);
-        pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+        CpuAffinity::PinThisThreadToCpu(*pinCpu);
+      } else {
+        CpuAffinity::PickAndPin("file_logger");
       }
 #endif
       static_cast<Derived *>(this)->RunLoop();
@@ -55,6 +62,12 @@ protected:
   std::atomic<bool> running_{false};
 };
 
+// FileLogger
+// Threading model:
+// - Single background thread performs round-robin draining of per-session SPSC
+//   queues and writes batched lines via writev
+// - Each session is a single producer to its own SPSC; the logger is the single
+//   consumer for all queues
 class FileLogger : public LoggerBase<FileLogger> {
 public:
   static constexpr std::size_t kRingCapacity = 1u << 16;
@@ -146,18 +159,19 @@ private:
     if (fd == -1) {
       return;
     }
-    LogEvent ev;
+    LogEvent batch[64];
     struct iovec iov[64];
     int cnt = 0;
-    while (q.pop(ev)) {
-      iov[cnt++] = {(void *)ev.buf, ev.len};
+    while (q.pop(batch[cnt])) {
+      iov[cnt] = {(void *)batch[cnt].buf, batch[cnt].len};
+      ++cnt;
       if (cnt == 64) {
-        ::writev(fd, iov, cnt);
+        io::WritevAll(fd, iov, cnt);
         cnt = 0;
       }
     }
     if (cnt > 0) {
-      ::writev(fd, iov, cnt);
+      io::WritevAll(fd, iov, cnt);
     }
   }
 

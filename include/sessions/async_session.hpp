@@ -1,10 +1,11 @@
 #pragma once
 
+#include "backoff.hpp"
 #include "latency.hpp"
 #include "logger.hpp"
 #include "message.hpp"
 #include "sessions/isession.hpp"
-#include <atomic>
+#include "ws_ops.hpp"
 #include <boost/asio.hpp>
 #include <boost/asio/spawn.hpp>
 #include <boost/asio/ssl.hpp>
@@ -13,12 +14,11 @@
 #include <boost/beast/websocket.hpp>
 #include <boost/beast/websocket/ssl.hpp>
 #include <ctime>
-#include <fstream>
+#include <expected>
 #include <iomanip>
 #include <iostream>
 #include <openssl/err.h>
 #include <string>
-#include <thread>
 
 namespace net = boost::asio;
 namespace ssl = net::ssl;
@@ -26,6 +26,15 @@ namespace beast = boost::beast;
 namespace websocket = beast::websocket;
 using tcp = net::ip::tcp;
 
+// AsyncSession
+// Threading model:
+// - Executes as a Boost.Asio coroutine (spawn) on the Reactor's io_context
+//   thread (reactor thread), i.e., no dedicated OS thread per session.
+// - All socket operations are non-blocking and cooperatively yield via `yield`.
+// - One session produces into its SPSC queue; the StreamMerger consumes on its
+//   own thread.
+// - Error handling on hot paths uses std::expected (C++23) instead of
+// exceptions
 class AsyncSession : public ISession {
 public:
   AsyncSession(int index, net::io_context &ioc, ssl::context &ssl_ctx,
@@ -60,98 +69,112 @@ public:
 
 private:
   void Run(net::yield_context yield) {
-    std::size_t backoff_ms = 200;
+    Backoff backoff;
     for (;;) {
-      beast::error_code ec;
-      try {
-        tcp::resolver resolver(ioc_);
-        auto results = resolver.async_resolve(host_, port_, yield[ec]);
-        if (ec) {
-          std::cerr << "[async_session " << index_
-                    << "] resolve error: " << ec.message() << "\n";
-          throw beast::system_error{ec};
-        }
-
-        websocket::stream<beast::ssl_stream<tcp::socket>> ws(ioc_, ssl_ctx_);
-
-        // TCP connect
-        net::async_connect(beast::get_lowest_layer(ws), results, yield[ec]);
-        if (ec) {
-          std::cerr << "[async_session " << index_
-                    << "] connect error: " << ec.message() << "\n";
-          throw beast::system_error{ec};
-        }
-
-        // SNI
-        if (!SSL_set_tlsext_host_name(ws.next_layer().native_handle(),
-                                      host_.c_str())) {
-          beast::error_code ssl_ec(static_cast<int>(::ERR_get_error()),
-                                   net::error::get_ssl_category());
-          throw beast::system_error{ssl_ec};
-        }
-
-        // TCP_NODELAY
-        beast::get_lowest_layer(ws).set_option(net::ip::tcp::no_delay(true),
-                                               ec);
-        ec.assign(0, ec.category());
-
-        // TLS handshake
-        ws.next_layer().async_handshake(ssl::stream_base::client, yield[ec]);
-        if (ec) {
-          std::cerr << "[async_session " << index_
-                    << "] handshake error: " << ec.message() << "\n";
-          throw beast::system_error{ec};
-        }
-
-        // Disable permessage-deflate
-        websocket::permessage_deflate pmd;
-        pmd.client_enable = false;
-        pmd.server_enable = false;
-        ws.set_option(pmd);
-
-        // Decorate UA
-        ws.set_option(
-            websocket::stream_base::decorator([](websocket::request_type &req) {
-              req.set(beast::http::field::user_agent,
-                      std::string("webhook-parsing/async/0.1"));
-            }));
-
-        // WS handshake
-        ws.async_handshake(host_, target_, yield[ec]);
-        if (ec)
-          throw beast::system_error{ec};
-
-        backoff_ms = 200; // reset after success
-
-        for (;;) {
-          beast::flat_buffer buffer;
-          ws.async_read(buffer, yield[ec]);
-          if (ec)
-            throw beast::system_error{ec};
-          const auto now_ms = EpochMillisUtc();
-          std::string payload = beast::buffers_to_string(buffer.data());
-          if (logger_) {
-            if (auto t = ExtractEventTimestampMs(payload)) {
-              logger_->LogLatency(session_queue_id_, now_ms - *t);
-            }
-          }
-          Message m;
-          m.connection_index = index_;
-          m.arrival_epoch_ms = now_ms;
-          m.payload = std::move(payload);
-          queue_->push(m);
-        }
-      } catch (const std::exception &e) {
-        std::cerr << "[async_session " << index_
-                  << "] reconnecting after error: " << e.what() << "\n";
-        // sleep before reconnect
-        net::steady_timer t(ioc_);
-        t.expires_after(std::chrono::milliseconds(backoff_ms));
-        beast::error_code tec;
-        t.async_wait(yield[tec]);
-        backoff_ms = std::min<std::size_t>(backoff_ms * 2, 5000);
+      websocket::stream<beast::ssl_stream<tcp::socket>> ws(ioc_, ssl_ctx_);
+      if (!FastConnectSequence(yield, ws, backoff)) {
+        continue;
       }
+      backoff.Reset();
+      beast::error_code ec = ReadLoop(yield, ws);
+      std::cerr << "[async_session " << index_
+                << "] reconnecting after error: " << ec.message() << "\n";
+      WaitAsync(ioc_, yield, backoff.Next());
     }
+  }
+
+  // FastConnectSequence: minimal-latency connection setup sequence
+  // Resolve → TCP connect → SNI → TCP_NODELAY → TLS handshake → Configure WS →
+  // WS handshake
+  bool
+  FastConnectSequence(net::yield_context yield,
+                      websocket::stream<beast::ssl_stream<tcp::socket>> &ws,
+                      Backoff &backoff) {
+    tcp::resolver resolver(ioc_);
+    // Resolve
+    auto resultsExp = AsyncResolve(resolver, host_, port_, yield);
+    if (!resultsExp) {
+      OnError("resolve", resultsExp.error(), yield, backoff);
+      return false;
+    }
+    // TCP connect
+    auto st_connect =
+        AsyncConnect(beast::get_lowest_layer(ws), *resultsExp, yield);
+    if (!st_connect) {
+      OnError("connect", st_connect.error(), yield, backoff);
+      return false;
+    }
+    // SNI
+    if (auto st = SetSni(ws.next_layer(), host_); !st) {
+      OnError("sni", st.error(), yield, backoff);
+      return false;
+    }
+
+    // TCP_NODELAY
+    SetTcpNoDelay(beast::get_lowest_layer(ws));
+
+    // TLS handshake
+    auto st_tls = AsyncTlsHandshake(ws.next_layer(), yield);
+    if (!st_tls) {
+      OnError("handshake", st_tls.error(), yield, backoff);
+      return false;
+    }
+
+    // Configure WS: disable permessage-deflate, set UA decorator
+    ConfigureWebSocket(ws, std::string("webhook-parsing/async/0.1"));
+    // WS handshake
+    auto st_ws = AsyncWsHandshake(ws, host_, target_, yield);
+    if (!st_ws) {
+      OnError("ws handshake", st_ws.error(), yield, backoff);
+      return false;
+    }
+
+    return true;
+  }
+
+  void ConfigureSocket(websocket::stream<beast::ssl_stream<tcp::socket>> &ws) {
+    websocket::permessage_deflate pmd;
+    pmd.client_enable = false;
+    pmd.server_enable = false;
+    ws.set_option(pmd);
+    ws.set_option(
+        websocket::stream_base::decorator([](websocket::request_type &req) {
+          req.set(beast::http::field::user_agent,
+                  std::string("webhook-parsing/async/0.1"));
+        }));
+  }
+
+  beast::error_code
+  ReadLoop(net::yield_context yield,
+           websocket::stream<beast::ssl_stream<tcp::socket>> &ws) {
+    beast::flat_buffer buffer;
+    beast::error_code ec;
+    for (;;) {
+      buffer.clear();
+      std::size_t nread = ws.async_read(buffer, yield[ec]);
+      (void)nread;
+      if (ec) {
+        break;
+      }
+      const auto now_ms = EpochMillisUtc();
+      std::string payload = beast::buffers_to_string(buffer.data());
+      auto t = ExtractEventTimestampMs(payload);
+      if (logger_ && t) {
+        logger_->LogLatency(session_queue_id_, now_ms - *t);
+      }
+      Message m;
+      m.arrival_epoch_ms = now_ms;
+      m.payload = std::move(payload);
+      queue_->push(m);
+    }
+    return ec;
+  }
+
+  void OnError(const char *stage, const beast::error_code &ec,
+               net::yield_context yield, Backoff &backoff) {
+    std::cerr << "[async_session " << index_ << "] " << stage
+              << " error: " << ec.message() << "\n";
+    WaitAsync(ioc_, yield, backoff.Next());
   }
 
   int index_;
