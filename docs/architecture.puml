@@ -1,0 +1,59 @@
+@startuml ComponentView
+title Low-latency market data ingestion — component & threading view
+skinparam componentStyle rectangle
+
+package "Process: webhook_parsing" {
+  node "Main thread" as Main
+  node "Reactor thread" as Reactor <<thread>>
+  component "boost::asio::io_context" as IoC
+  Reactor -[hidden]-> IoC
+
+  cloud "Binance WSS (bookTicker)" as Binance
+
+  folder "Sessions" {
+    component "AsyncSession [1..K]\n(coroutines on Reactor)" as AsyncSessions
+    component "SyncSession [1..K]\n(each std::jthread)" as SyncSessions
+  }
+
+  queue "MessageQueue (SPSC)\nper session" as MQ
+  queue "Latency SPSC\nper session" as LQ
+
+  node "StreamMerger thread" as Merger <<thread>>
+  node "FileLogger thread" as Logger <<thread>>
+
+  file "latencies/stream_{mode}_N{K}_timestamp.ndjson" as NDJSON
+  file "latencies/{async|sync}_conn_*.lat" as LAT
+
+  Binance -down- AsyncSessions : TLS/WebSocket
+  Binance -down- SyncSessions : TLS/WebSocket
+
+  AsyncSessions --> MQ : Message{arrival_ms,payload}
+  SyncSessions  --> MQ
+
+  MQ --> Merger : consume all queues
+  Merger --> NDJSON : coalesced write(2)
+
+  AsyncSessions --> LQ : LogEvent(ms) per session
+  SyncSessions  --> LQ
+
+  LQ --> Logger : round-robin drain
+  Logger --> LAT : writev batches
+
+  Main --> Reactor : start/stop io_context
+  Main --> Merger  : start/join
+  Main --> Logger  : start/join
+
+  note right of Reactor
+    io_context::run() on 1 worker (pinned)
+  end note
+
+  note right of Merger
+    min-heap by `u`\nhold-back 20ms\nfirst-wins dedup
+  end note
+
+  note right of Logger
+    per-session SPSC rings\nwritev batching
+  end note
+}
+@enduml
+

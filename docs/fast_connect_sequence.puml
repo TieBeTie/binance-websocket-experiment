@@ -1,0 +1,26 @@
+@startuml FastConnectSequence
+title FastConnectSequence for a session (async/sync helpers)
+actor Session
+participant "tcp::resolver" as Resolver
+participant "tcp::socket" as Sock
+participant "ssl_stream" as SSL
+participant "websocket::stream" as WS
+
+Session -> Resolver : resolve(host, port)
+Resolver --> Session : endpoints
+Session -> Sock : connect(endpoints)
+Session -> SSL : SetSni(host)\nSetTcpNoDelay(socket)
+Session -> SSL : TLS handshake
+Session -> WS  : ConfigureWebSocket\n(disable PMD, set UA)
+Session -> WS  : WS handshake(host, target)
+WS --> Session : ready
+
+loop Read loop
+  Session -> WS : read()/async_read()
+  WS --> Session : payload
+  Session -> Logger : LogLatency(now_ms - {T|E})
+  Session -> MQ : push Message
+end
+@enduml
+
+
