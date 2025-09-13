@@ -3,6 +3,24 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 # =====================
+# Parse command line arguments
+# =====================
+USE_CCACHE=false
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --ccache)
+      USE_CCACHE=true
+      shift
+      ;;
+    *)
+      echo "Unknown option: $1"
+      echo "Usage: $0 [--ccache]"
+      exit 1
+      ;;
+  esac
+done
+
+# =====================
 # Config (override via env or edit here)
 # =====================
 URL=${URL:-"wss://fstream.binance.com/ws/btcusdt@bookTicker"}
@@ -20,17 +38,22 @@ if command -v g++-13 >/dev/null 2>&1; then
 else
   CXX=g++; CC=gcc
 fi
-echo "[BUILD] Configure RelWithDebInfo"
-# Fresh configure to avoid stale compiler/toolchain cache
-rm -rf build
-cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_COMPILER=${CXX} -DCMAKE_C_COMPILER=${CC}
-echo "[BUILD] Build RelWithDebInfo"
-cmake --build build -j
+
+# Setup ccache if requested
+CCACHE_LAUNCHER=""
+if [[ "$USE_CCACHE" == "true" ]]; then
+  if command -v ccache >/dev/null 2>&1; then
+    echo "[BUILD] Using ccache for faster builds"
+    CCACHE_LAUNCHER="-DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache"
+  else
+    echo "[WARNING] --ccache requested but ccache not found, continuing without ccache"
+  fi
+fi
 
 # Build (Release) for runs
 echo "[BUILD] Configure Release"
 rm -rf build
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=${CXX} -DCMAKE_C_COMPILER=${CC}
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=${CXX} -DCMAKE_C_COMPILER=${CC} ${CCACHE_LAUNCHER}
 echo "[BUILD] Build Release"
 cmake --build build -j
 

@@ -2,9 +2,10 @@
 
 #include "core/isession.hpp"
 #include "core/message.hpp"
-#include "logging/logger.hpp"
+#include "logging/latency_event.hpp"
 #include "net/backoff.hpp"
 #include "net/ws_ops.hpp"
+#include "util/branch.hpp"
 #include "util/latency.hpp"
 #include <boost/asio.hpp>
 #include <boost/asio/spawn.hpp>
@@ -13,8 +14,6 @@
 #include <boost/beast/ssl.hpp>
 #include <boost/beast/websocket.hpp>
 #include <boost/beast/websocket/ssl.hpp>
-#include <ctime>
-#include <iomanip>
 #include <iostream>
 #include <openssl/err.h>
 #include <string>
@@ -38,29 +37,11 @@ class AsyncSession : public ISession {
 public:
   AsyncSession(int index, net::io_context &ioc, ssl::context &ssl_ctx,
                std::string host, std::string port, std::string target,
-               std::shared_ptr<MessageQueue> queue, FileLogger *logger)
+               std::shared_ptr<RawOrderQueue> queue,
+               std::shared_ptr<logging::LatencyQueue> latency_queue)
       : index_(index), ioc_(ioc), ssl_ctx_(ssl_ctx), host_(std::move(host)),
         port_(std::move(port)), target_(std::move(target)),
-        queue_(std::move(queue)), logger_(logger) {
-    try {
-      auto now = std::chrono::system_clock::now();
-      std::time_t tt = std::chrono::system_clock::to_time_t(now);
-      std::tm tm{};
-#if defined(_WIN32)
-      localtime_s(&tm, &tt);
-#else
-      localtime_r(&tt, &tm);
-#endif
-      std::ostringstream ts;
-      ts << std::put_time(&tm, "%Y%m%d_%H%M%S");
-      if (logger_) {
-        session_queue_id_ = logger_->RegisterSession(
-            std::string("latencies/async_conn_") + std::to_string(index_) +
-            "_" + ts.str() + ".lat");
-      }
-    } catch (...) {
-    }
-  }
+        ring_(std::move(queue)), latency_queue_(std::move(latency_queue)) {}
 
   void Start() override {
     net::spawn(ioc_, [this](net::yield_context yield) { this->Run(yield); });
@@ -99,12 +80,12 @@ private:
     // TCP connect
     auto st_connect =
         wsops::AsyncConnect(beast::get_lowest_layer(ws), *resultsExp, yield);
-    if (!st_connect) {
+    if (BRANCH_UNLIKELY(!st_connect)) {
       OnError("connect", st_connect.error(), yield, backoff);
       return false;
     }
     // SNI
-    if (auto st = wsops::SetSni(ws.next_layer(), host_); !st) {
+    if (auto st = wsops::SetSni(ws.next_layer(), host_); BRANCH_UNLIKELY(!st)) {
       OnError("sni", st.error(), yield, backoff);
       return false;
     }
@@ -114,7 +95,7 @@ private:
 
     // TLS handshake
     auto st_tls = wsops::AsyncTlsHandshake(ws.next_layer(), yield);
-    if (!st_tls) {
+    if (BRANCH_UNLIKELY(!st_tls)) {
       OnError("handshake", st_tls.error(), yield, backoff);
       return false;
     }
@@ -123,7 +104,7 @@ private:
     wsops::ConfigureWebSocket(ws, std::string("webhook-parsing/async/0.1"));
     // WS handshake
     auto st_ws = wsops::AsyncWsHandshake(ws, host_, target_, yield);
-    if (!st_ws) {
+    if (BRANCH_UNLIKELY(!st_ws)) {
       OnError("ws handshake", st_ws.error(), yield, backoff);
       return false;
     }
@@ -146,25 +127,20 @@ private:
   beast::error_code
   ReadLoop(net::yield_context yield,
            websocket::stream<beast::ssl_stream<tcp::socket>> &ws) {
-    beast::flat_buffer buffer;
     beast::error_code ec;
     for (;;) {
-      buffer.clear();
-      std::size_t nread = ws.async_read(buffer, yield[ec]);
-      (void)nread;
-      if (ec) {
+      RawOrderUpdate slot;
+      (void)ring_->acquire(slot);
+      slot.clear();
+      std::size_t nread = ws.async_read(slot, yield[ec]);
+      if (BRANCH_UNLIKELY(ec)) {
         break;
       }
       const auto now_ms = lat::EpochMillisUtc();
-      std::string payload = beast::buffers_to_string(buffer.data());
-      auto t = lat::ExtractEventTimestampMs(payload);
-      if (logger_ && t) {
-        logger_->LogLatency(session_queue_id_, now_ms - *t);
-      }
-      Message m;
-      m.arrival_epoch_ms = now_ms;
-      m.payload = std::move(payload);
-      queue_->push(m);
+      const auto event_ms = lat::ExtractEventTimestampMs(std::string_view{
+          static_cast<const char *>(slot.data().data()), nread});
+      latency_queue_->push({now_ms, event_ms});
+      (void)ring_->publish(std::move(slot));
     }
     return ec;
   }
@@ -182,7 +158,6 @@ private:
   std::string host_;
   std::string port_;
   std::string target_;
-  std::shared_ptr<MessageQueue> queue_;
-  FileLogger *logger_;
-  uint16_t session_queue_id_ = 0;
+  std::shared_ptr<RawOrderQueue> ring_;
+  std::shared_ptr<logging::LatencyQueue> latency_queue_;
 };

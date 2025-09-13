@@ -1,12 +1,14 @@
 #pragma once
 
 #include "core/message.hpp"
+#include "util/branch.hpp"
 #include <atomic>
 #include <charconv>
 #include <chrono>
 #include <optional>
 #include <queue>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 #ifdef __linux__
@@ -28,7 +30,7 @@
 class StreamMerger {
 public:
   // Construct merger with producer queues and output file path
-  StreamMerger(std::vector<std::shared_ptr<MessageQueue>> queues,
+  StreamMerger(std::vector<std::shared_ptr<RawOrderQueue>> queues,
                std::string out_file)
       : queues_(std::move(queues)) {
     fd_ = ::open(out_file.c_str(), O_CREAT | O_WRONLY | O_TRUNC | O_CLOEXEC,
@@ -89,19 +91,20 @@ private:
 
   // Buffered entry stored in the reordering heap
   struct BufEntry {
-    std::uint64_t u;              // updateId used for ordering/dedup
-    Clock::time_point first_seen; // arrival time at the merger
-    std::string payload;          // raw NDJSON payload
+    std::uint64_t u;               // updateId used for ordering/dedup
+    Clock::time_point first_seen;  // arrival time at the merger
+    std::size_t src;               // source queue index to release back
+    boost::beast::flat_buffer buf; // raw NDJSON payload (contiguous)
   };
 
   // Fast parsing of updateId `u` from the payload
-  static std::optional<std::uint64_t> ExtractUpdateId(const std::string &s) {
+  static std::optional<std::uint64_t> ExtractUpdateId(std::string_view s) {
     std::size_t pos = s.find("\"u\"");
-    if (pos == std::string::npos) {
+    if (pos == std::string_view::npos) {
       return std::nullopt;
     }
     pos = s.find(':', pos);
-    if (pos == std::string::npos) {
+    if (pos == std::string_view::npos) {
       return std::nullopt;
     }
     ++pos;
@@ -121,7 +124,7 @@ private:
   // Returns true if all producer SPSC queues are currently empty
   bool AllQueuesEmpty() const {
     for (const auto &q : queues_) {
-      if (q->read_available() != 0) {
+      if (q->ready_size() != 0) {
         return false;
       }
     }
@@ -132,9 +135,12 @@ private:
   // only if u > last_emitted_u_ (late duplicates dropped on push)
   void IngestQueues() {
     for (std::size_t i = 0; i < queues_.size(); ++i) {
-      Message m;
-      while (queues_[i]->pop(m)) {
-        auto ou = ExtractUpdateId(m.payload);
+      RawOrderUpdate m;
+      while (queues_[i]->consume(m)) {
+        auto cb = m.data();
+        const char *data = static_cast<const char *>(cb.data());
+        std::size_t len = cb.size();
+        auto ou = ExtractUpdateId(std::string_view{data, len});
         if (!ou.has_value()) {
           continue;
         }
@@ -142,7 +148,7 @@ private:
         if (u <= last_emitted_u_) {
           continue;
         }
-        BufEntry e{u, Clock::now(), std::move(m.payload)};
+        BufEntry e{u, Clock::now(), i, std::move(m)};
         minheap_.push(std::move(e));
       }
     }
@@ -153,31 +159,51 @@ private:
   // one buffer, and writes once. Updates last_emitted_u_. Late duplicates (same
   // `u` still in heap) are dropped on a subsequent iteration when observed.
   void FlushReady() {
-    if (fd_ == -1) {
+    if (BRANCH_UNLIKELY(fd_ == -1)) {
       return;
     }
     const auto now = Clock::now();
-    std::string buffer;
-    buffer.reserve(64 * 512);
     std::uint64_t last_u = last_emitted_u_;
+    // Batch up to 64 entries with writev: [payload, "\n"] pairs
+    std::vector<BufEntry> batch_entries;
+    batch_entries.reserve(64);
+    struct iovec iov[128];
+    int iov_cnt = 0;
+    static const char newline = '\n';
 
-    while (!minheap_.empty() && buffer.size() < buffer.capacity() - 2) {
-      const BufEntry &e = minheap_.top();
-      if (e.u <= last_u) {
+    while (!minheap_.empty()) {
+      const BufEntry &top = minheap_.top();
+      if (BRANCH_UNLIKELY(top.u <= last_u)) {
         minheap_.pop();
         continue;
       }
-      if (now - e.first_seen < kHoldback_) {
+      if (BRANCH_UNLIKELY(now - top.first_seen < kHoldback_)) {
         break;
       }
-      buffer.append(e.payload);
-      buffer.push_back('\n');
-      last_u = e.u;
+      BufEntry e = std::move(const_cast<BufEntry &>(top));
       minheap_.pop();
+      auto b = e.buf.data();
+      iov[iov_cnt++] = {(void *)b.data(), b.size()};
+      iov[iov_cnt++] = {(void *)&newline, 1};
+      last_u = e.u;
+      batch_entries.emplace_back(std::move(e));
+      if (iov_cnt >= 128) {
+        io::WritevAll(fd_, iov, iov_cnt);
+        // release consumed buffers back to producer rings
+        for (auto &be : batch_entries) {
+          queues_[be.src]->release(std::move(be.buf));
+        }
+        iov_cnt = 0;
+        batch_entries.clear();
+      }
     }
 
-    if (!buffer.empty()) {
-      io::WriteAll(fd_, buffer.data(), buffer.size());
+    if (iov_cnt > 0) {
+      io::WritevAll(fd_, iov, iov_cnt);
+      for (auto &be : batch_entries) {
+        queues_[be.src]->release(std::move(be.buf));
+      }
+      batch_entries.clear();
       last_emitted_u_ = last_u;
     }
   }
@@ -188,30 +214,36 @@ private:
     if (fd_ == -1) {
       return;
     }
-    std::string buffer;
-    buffer.reserve(64 * 512);
-
+    struct iovec iov[128];
+    static const char newline = '\n';
     while (!minheap_.empty()) {
-      buffer.clear();
+      int iov_cnt = 0;
       std::uint64_t last_u = last_emitted_u_;
-      while (!minheap_.empty() && buffer.size() < buffer.capacity() - 2) {
-        const BufEntry &e = minheap_.top();
-        if (e.u > last_u) {
-          buffer.append(e.payload);
-          buffer.push_back('\n');
-          last_u = e.u;
-        }
+      std::vector<BufEntry> batch_entries;
+      batch_entries.reserve(64);
+      while (!minheap_.empty() && iov_cnt <= 126) {
+        BufEntry e = std::move(const_cast<BufEntry &>(minheap_.top()));
         minheap_.pop();
+        if (e.u > last_u) {
+          auto b = e.buf.data();
+          iov[iov_cnt++] = {(void *)b.data(), b.size()};
+          iov[iov_cnt++] = {(void *)&newline, 1};
+          last_u = e.u;
+          batch_entries.emplace_back(std::move(e));
+        }
       }
-      if (!buffer.empty()) {
-        io::WriteAll(fd_, buffer.data(), buffer.size());
+      if (iov_cnt > 0) {
+        io::WritevAll(fd_, iov, iov_cnt);
+        for (auto &be : batch_entries) {
+          queues_[be.src]->release(std::move(be.buf));
+        }
         last_emitted_u_ = last_u;
       }
     }
   }
 
   // Producer queues feeding the merger
-  std::vector<std::shared_ptr<MessageQueue>> queues_;
+  std::vector<std::shared_ptr<RawOrderQueue>> queues_;
   // Output file descriptor (append-only)
   int fd_ = -1;
   // Worker thread handling ingestion and flush

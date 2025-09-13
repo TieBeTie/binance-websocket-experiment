@@ -2,9 +2,10 @@
 
 #include "core/isession.hpp"
 #include "core/message.hpp"
-#include "logging/logger.hpp"
+#include "logging/latency_event.hpp"
 #include "net/backoff.hpp"
 #include "net/ws_ops.hpp"
+#include "util/branch.hpp"
 #include "util/latency.hpp"
 #include <boost/asio.hpp>
 #include <boost/asio/ssl.hpp>
@@ -12,9 +13,7 @@
 #include <boost/beast/ssl.hpp>
 #include <boost/beast/websocket.hpp>
 #include <boost/beast/websocket/ssl.hpp>
-#include <ctime>
 #include <expected>
-#include <iomanip>
 #include <iostream>
 #include <openssl/err.h>
 #include <string>
@@ -37,28 +36,11 @@ using tcp = net::ip::tcp;
 class SyncSession : public ISession {
 public:
   SyncSession(int index, std::string host, std::string port, std::string target,
-              std::shared_ptr<MessageQueue> queue, FileLogger *logger)
+              std::shared_ptr<RawOrderQueue> queue,
+              std::shared_ptr<logging::LatencyQueue> latency_queue)
       : index_(index), host_(std::move(host)), port_(std::move(port)),
-        target_(std::move(target)), queue_(std::move(queue)), logger_(logger) {
-    try {
-      auto now = std::chrono::system_clock::now();
-      std::time_t tt = std::chrono::system_clock::to_time_t(now);
-      std::tm tm{};
-#if defined(_WIN32)
-      localtime_s(&tm, &tt);
-#else
-      localtime_r(&tt, &tm);
-#endif
-      std::ostringstream ts;
-      ts << std::put_time(&tm, "%Y%m%d_%H%M%S");
-      if (logger_) {
-        session_queue_id_ = logger_->RegisterSession(
-            std::string("latencies/sync_conn_") + std::to_string(index_) + "_" +
-            ts.str() + ".lat");
-      }
-    } catch (...) {
-    }
-  }
+        target_(std::move(target)), ring_(std::move(queue)),
+        latency_queue_(std::move(latency_queue)) {}
 
   void Start() override {
     jthread_ = std::jthread([this](std::stop_token st) { this->Run(st); });
@@ -110,7 +92,7 @@ private:
     tcp::resolver resolver(ws.get_executor());
 
     auto st_resolve = wsops::Resolve(resolver, host_, port_);
-    if (!st_resolve) {
+    if (BRANCH_UNLIKELY(!st_resolve)) {
       OnError("resolve", st_resolve.error());
       retry::WaitSync(backoff.Next());
       return false;
@@ -118,13 +100,13 @@ private:
 
     auto st_connect =
         wsops::Connect(beast::get_lowest_layer(ws).socket(), *st_resolve);
-    if (!st_connect) {
+    if (BRANCH_UNLIKELY(!st_connect)) {
       OnError("connect", st_connect.error());
       retry::WaitSync(backoff.Next());
       return false;
     }
 
-    if (auto st = wsops::SetSni(ws.next_layer(), host_); !st) {
+    if (auto st = wsops::SetSni(ws.next_layer(), host_); BRANCH_UNLIKELY(!st)) {
       OnError("sni", st.error());
       retry::WaitSync(backoff.Next());
       return false;
@@ -133,7 +115,7 @@ private:
     wsops::SetTcpNoDelay(beast::get_lowest_layer(ws));
 
     auto st_tls = wsops::TlsHandshake(ws.next_layer());
-    if (!st_tls) {
+    if (BRANCH_UNLIKELY(!st_tls)) {
       OnError("handshake", st_tls.error());
       retry::WaitSync(backoff.Next());
       return false;
@@ -142,7 +124,7 @@ private:
     wsops::ConfigureWebSocket(ws, std::string("webhook-parsing/0.1"));
 
     auto st_ws = wsops::WsHandshake(ws, host_, target_);
-    if (!st_ws) {
+    if (BRANCH_UNLIKELY(!st_ws)) {
       OnError("ws handshake", st_ws.error());
       retry::WaitSync(backoff.Next());
       return false;
@@ -158,13 +140,15 @@ private:
       if (st.stop_requested()) {
         return {};
       }
-      beast::flat_buffer buffer;
+      RawOrderUpdate slot;
       beast::error_code ec;
       // Короткий дедлайн для регулярной проверки stop_token
       beast::get_lowest_layer(ws).expires_after(std::chrono::milliseconds(200));
-      ws.read(buffer, ec);
-      if (ec) {
-        if (ec == beast::error::timeout) {
+      (void)ring_->acquire(slot);
+      slot.clear();
+      ws.read(slot, ec);
+      if (BRANCH_UNLIKELY(ec)) {
+        if (BRANCH_UNLIKELY(ec == beast::error::timeout)) {
           if (st.stop_requested()) {
             return {};
           }
@@ -173,15 +157,13 @@ private:
         return ec;
       }
       const auto now_ms = lat::EpochMillisUtc();
-      std::string payload = beast::buffers_to_string(buffer.data());
-      auto t = lat::ExtractEventTimestampMs(payload);
-      if (logger_ && t) {
-        logger_->LogLatency(session_queue_id_, now_ms - *t);
-      }
-      Message m;
-      m.arrival_epoch_ms = now_ms;
-      m.payload = std::move(payload);
-      queue_->push(m);
+      auto b = slot.data();
+      const char *data = static_cast<const char *>(b.data());
+      std::size_t len = b.size();
+      const std::int64_t event_ms =
+          lat::ExtractEventTimestampMs(std::string_view{data, len});
+      latency_queue_->push({now_ms, event_ms});
+      (void)ring_->publish(std::move(slot));
     }
   }
 
@@ -194,8 +176,7 @@ private:
   std::string host_;
   std::string port_;
   std::string target_;
-  std::shared_ptr<MessageQueue> queue_;
+  std::shared_ptr<RawOrderQueue> ring_;
   std::jthread jthread_;
-  FileLogger *logger_;
-  uint16_t session_queue_id_ = 0;
+  std::shared_ptr<logging::LatencyQueue> latency_queue_;
 };

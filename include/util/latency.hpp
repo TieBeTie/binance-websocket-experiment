@@ -1,12 +1,10 @@
 #pragma once
 
-#include <algorithm>
+#include "util/branch.hpp"
 #include <cctype>
 #include <chrono>
 #include <cstdint>
-#include <optional>
-#include <string>
-#include <vector>
+#include <string_view>
 
 // namespace lat — small helpers for timestamp extraction and timepoints used in
 // latency measurement. Keeps parsing and time utilities in one place.
@@ -19,71 +17,19 @@ inline std::int64_t EpochMillisUtc() {
       .count();
 }
 
-inline std::optional<std::int64_t> ExtractTTimestampMs(const std::string &s) {
-  auto pos = s.find("\"T\"");
-  if (pos == std::string::npos)
-    return std::nullopt;
-  pos = s.find(':', pos);
-  if (pos == std::string::npos)
-    return std::nullopt;
-  ++pos;
-  while (pos < s.size() && std::isspace(static_cast<unsigned char>(s[pos])))
-    ++pos;
+inline std::int64_t ExtractEventTimestampMs(std::string_view sv) {
+  std::size_t pos = sv.find("\"E\":");
+  if (BRANCH_UNLIKELY(pos == std::string_view::npos)) {
+    return 0;
+  }
+  const char *p = sv.data() + pos + 4; // after "E":
   std::int64_t value = 0;
-  bool neg = false;
-  if (pos < s.size() && s[pos] == '-') {
-    neg = true;
-    ++pos;
+  // p < end is guaranteed by the condition above
+  while (BRANCH_LIKELY(*p >= '0' && *p <= '9')) {
+    value = value * 10 + (*p - '0');
+    ++p;
   }
-  bool any = false;
-  for (; pos < s.size(); ++pos) {
-    char c = s[pos];
-    if (c < '0' || c > '9')
-      break;
-    any = true;
-    value = value * 10 + (c - '0');
-  }
-  if (!any)
-    return std::nullopt;
-  return neg ? -value : value;
-}
-
-inline std::optional<std::int64_t>
-ExtractEventTimestampMs(const std::string &s) {
-  if (auto t = ExtractTTimestampMs(s)) {
-    return t;
-  }
-  auto pos = s.find("\"E\"");
-  if (pos == std::string::npos) {
-    return std::nullopt;
-  }
-  pos = s.find(':', pos);
-  if (pos == std::string::npos) {
-    return std::nullopt;
-  }
-  ++pos;
-  while (pos < s.size() && std::isspace(static_cast<unsigned char>(s[pos]))) {
-    ++pos;
-  }
-  std::int64_t value = 0;
-  bool neg = false;
-  if (pos < s.size() && s[pos] == '-') {
-    neg = true;
-    ++pos;
-  }
-  bool any = false;
-  for (; pos < s.size(); ++pos) {
-    char c = s[pos];
-    if (c < '0' || c > '9') {
-      break;
-    }
-    any = true;
-    value = value * 10 + (c - '0');
-  }
-  if (!any) {
-    return std::nullopt;
-  }
-  return neg ? -value : value;
+  return value;
 }
 
 } // namespace lat

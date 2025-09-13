@@ -44,8 +44,6 @@ if (NOT MSVC)
   check_cxx_compiler_flag("-std=c++23" HAS_CXX23)
   if (HAS_CXX23)
     target_compile_options(webhook_parsing PRIVATE -std=c++23)
-  else()
-    message(FATAL_ERROR "Compiler does not support -std=c++23. Please use GCC 13+ (g++-13).")
   endif()
 endif()
 

@@ -16,13 +16,11 @@
 #include <sched.h>
 #endif
 #include "io/file_writer.hpp"
+#include "logging/latency_event.hpp"
+#include "util/branch.hpp"
 #include "util/cpu_affinity.hpp"
 
-// LogEvent: pre-formatted line (ASCII digits + optional '-') ready for write
-struct LogEvent {
-  uint16_t len;
-  char buf[32];
-};
+using logging::LatencyEvent;
 
 // LoggerBase
 // Threading model:
@@ -70,8 +68,6 @@ protected:
 //   consumer for all queues
 class FileLogger : public LoggerBase<FileLogger> {
 public:
-  static constexpr std::size_t kRingCapacity = 1u << 16;
-
   FileLogger() = default;
 
   ~FileLogger() {
@@ -80,36 +76,26 @@ public:
     CloseAll();
   }
 
-  uint16_t RegisterSession(const std::string &path) {
+  // Add a session by attaching an external SPSC queue. Logger does not own
+  // the queue storage beyond shared ownership.
+  uint16_t AddSession(std::shared_ptr<logging::LatencyQueue> externalQueue,
+                      const std::string &path) {
     int fd =
         ::open(path.c_str(), O_CREAT | O_WRONLY | O_APPEND | O_CLOEXEC, 0644);
     uint16_t id = static_cast<uint16_t>(fds_.size());
     fds_.push_back(fd);
-    queues_.emplace_back(std::make_unique<QueueType>());
+    ext_queues_.push_back(std::move(externalQueue));
     return id;
-  }
-
-  void LogLatency(uint16_t sessionId, std::int64_t deltaMs) {
-    if (!alive_.load(std::memory_order_relaxed)) {
-      return;
-    }
-    if (sessionId >= queues_.size()) {
-      return;
-    }
-    LogEvent ev;
-    ev.len = ItoaFast(deltaMs, ev.buf);
-    ev.buf[ev.len++] = '\n';
-    queues_[sessionId]->push(ev); // drop if full
   }
 
   void RunLoop() {
     std::size_t current = 0;
     for (;;) {
-      if (!this->running_.load(std::memory_order_relaxed)) {
+      if (BRANCH_UNLIKELY(!this->running_.load(std::memory_order_relaxed))) {
         break;
       }
-      const std::size_t n = queues_.size();
-      if (n == 0) {
+      const std::size_t n = ext_queues_.size();
+      if (BRANCH_UNLIKELY(n == 0)) {
         std::this_thread::yield();
         continue;
       }
@@ -119,7 +105,8 @@ public:
       DrainQueue(current);
       ++current;
     }
-    for (std::size_t i = 0; i < queues_.size(); ++i) {
+    const std::size_t n = ext_queues_.size();
+    for (std::size_t i = 0; i < n; ++i) {
       DrainQueue(i);
     }
   }
@@ -156,21 +143,27 @@ private:
   }
 
   void DrainQueue(std::size_t i) {
-    if (i >= queues_.size()) {
+    if (BRANCH_UNLIKELY(i >= ext_queues_.size())) {
       return;
     }
-    auto &q = *queues_[i];
+    auto &q = *ext_queues_[i];
     int fd = fds_[i];
-    if (fd == -1) {
+    if (BRANCH_UNLIKELY(fd == -1)) {
       return;
     }
-    LogEvent batch[64];
-    struct iovec iov[64];
+    LatencyEvent ev;
+    struct iovec iov[128];
+    char linebuf[128][32];
+    uint16_t lens[128];
     int cnt = 0;
-    while (q.pop(batch[cnt])) {
-      iov[cnt] = {(void *)batch[cnt].buf, batch[cnt].len};
+    // batch consume to reduce syscalls and atomics
+    while (q.pop(ev)) {
+      std::int64_t delta = ev.arrival_ms - ev.event_ms;
+      lens[cnt] = ItoaFast(std::abs(delta), linebuf[cnt]);
+      linebuf[cnt][lens[cnt]++] = '\n';
+      iov[cnt] = {(void *)linebuf[cnt], lens[cnt]};
       ++cnt;
-      if (cnt == 64) {
+      if (cnt == 128) {
         io::WritevAll(fd, iov, cnt);
         cnt = 0;
       }
@@ -180,10 +173,7 @@ private:
     }
   }
 
-  using QueueType =
-      boost::lockfree::spsc_queue<LogEvent,
-                                  boost::lockfree::capacity<kRingCapacity>>;
-  std::vector<std::unique_ptr<QueueType>> queues_;
+  std::vector<std::shared_ptr<logging::LatencyQueue>> ext_queues_;
   std::vector<int> fds_;
   std::atomic<bool> alive_{true};
 };

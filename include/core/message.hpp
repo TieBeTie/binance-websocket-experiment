@@ -1,14 +1,10 @@
 #pragma once
 
+#include "lockfree/ring.hpp"
+#include <boost/beast/core/flat_buffer.hpp>
 #include <boost/lockfree/spsc_queue.hpp>
-#include <cstdint>
-#include <string>
 
-struct Message {
-  std::int64_t arrival_epoch_ms;
-  std::string payload;
-};
+using RawOrderUpdate = boost::beast::flat_buffer;
 
-static constexpr std::size_t kMessageQueueCapacity = 16384;
-using MessageQueue = boost::lockfree::spsc_queue<
-    Message, boost::lockfree::capacity<kMessageQueueCapacity>>;
+static constexpr std::size_t kRawOrderQueueCapacity = 16384;
+using RawOrderQueue = lockfree::Ring<RawOrderUpdate, kRawOrderQueueCapacity>;

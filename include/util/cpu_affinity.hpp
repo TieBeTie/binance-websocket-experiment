@@ -1,5 +1,6 @@
 #pragma once
 
+#include "util/time.hpp"
 #include <algorithm>
 #include <chrono>
 #include <ctime>
@@ -180,17 +181,8 @@ private:
 
   static void PrintPinned(const char *who, int cpu) {
 #ifdef __linux__
-    std::time_t t = std::time(nullptr);
-    struct tm tm_buf;
-    char ts[32];
-    if (localtime_r(&t, &tm_buf) != nullptr) {
-      if (std::strftime(ts, sizeof(ts), "%H:%M:%S", &tm_buf) == 0) {
-        ts[0] = '\0';
-      }
-    } else {
-      ts[0] = '\0';
-    }
-    if (ts[0] != '\0') {
+    const std::string ts = timeutil::ClockTime();
+    if (!ts.empty()) {
       std::cout << "[" << ts << "] [affinity] " << (who ? who : "thread")
                 << " pinned to CPU " << cpu << "\n";
     } else {
